@@ -287,7 +287,8 @@ class Translator:
         else:
             self._api = None
 
-    def translate(self, text: str, src: str | None, tgt: str) -> tuple[str, str]:
+    def translate(self, text: str, src: str | None, tgt: str,
+                  store: bool = True) -> tuple[str, str]:
         if src and ArgosBackend.code(src) == ArgosBackend.code(tgt):
             return text, "без перевода"
         mode = self.cfg.translation_mode
@@ -299,7 +300,8 @@ class Translator:
         if self._api is not None:
             try:
                 result = self._api.translate(text, src, tgt)
-                self.cache.put(key, result)
+                if store:
+                    self.cache.put(key, result)
                 return result, self._api.label
             except TranslationError as api_exc:
                 if not self.cfg.api_fallback_to_local:
@@ -310,11 +312,13 @@ class Translator:
                 except TranslationError as local_exc:
                     raise TranslationError(f"{api_exc}; офлайн: {local_exc}") from local_exc
 
-                self.cache.put(TranslationCache.key("local", src, tgt, text), result)
+                if store:
+                    self.cache.put(TranslationCache.key("local", src, tgt, text), result)
                 return result, f"{self.argos.label}, т.к. {api_exc}"
 
         result = self.argos.translate(text, src, tgt)
-        self.cache.put(key, result)
+        if store:
+            self.cache.put(key, result)
         return result, self.argos.label
 
 
@@ -332,16 +336,30 @@ class TranslationWorker(QThread):
         self._pending_cfg: Settings | None = settings.copy()
         self._cfg_lock = threading.Lock()
         self.translator = Translator(cache, lambda m: self.status_changed.emit("info", m))
+        self._seq = 0
+        self._latest: dict[int, int] = {}
+        self._latest_lock = threading.Lock()
 
     def update_settings(self, settings: Settings) -> None:
         with self._cfg_lock:
             self._pending_cfg = settings.copy()
 
-    def submit(self, uid: int, text: str, src: str | None, tgt: str) -> None:
-        self._queue.put(("translate", uid, text, src, tgt))
+    def submit(self, uid: int, text: str, src: str | None, tgt: str, final: bool = True) -> None:
+        with self._latest_lock:
+            self._seq += 1
+            self._latest[uid] = self._seq
+            if len(self._latest) > 500:
+                for k in list(self._latest)[:250]:
+                    self._latest.pop(k, None)
+            seq = self._seq
+        self._queue.put(("translate", uid, text, src, tgt, final, seq))
 
     def preload(self, src: str, tgt: str) -> None:
-        self._queue.put(("preload", 0, "", src, tgt))
+        self._queue.put(("preload", 0, "", src, tgt, True, 0))
+
+    def _is_stale(self, uid: int, seq: int) -> bool:
+        with self._latest_lock:
+            return seq < self._latest.get(uid, seq)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -367,20 +385,26 @@ class TranslationWorker(QThread):
                     break
                 if old is None:
                     return
-                if old[0] == "translate":
+                if old[0] == "translate" and old[5] and not self._is_stale(old[1], old[6]):
                     self.failed.emit(old[1], "пропущено: перевод не успевает")
 
-            kind, uid, text, src, tgt = job
+            kind, uid, text, src, tgt, final, seq = job
+            if kind == "translate" and self._is_stale(uid, seq):
+                continue
             try:
                 if kind == "preload":
                     self.translator.argos.ensure_pair(ArgosBackend.code(src), ArgosBackend.code(tgt))
                     self.status_changed.emit("info", f"Офлайн-пакет {language_name(src)} → "
                                                      f"{language_name(tgt)} установлен")
                     continue
-                result, engine = self.translator.translate(text, src, tgt)
+                result, engine = self.translator.translate(text, src, tgt, store=final)
+                if self._is_stale(uid, seq):
+                    continue
                 self.translated.emit(uid, result, engine)
                 self.status_changed.emit("ok", "")
             except TranslationError as exc:
+                if not final:
+                    continue
                 self.failed.emit(uid, str(exc))
                 self.status_changed.emit("error_translate", f"Ошибка перевода: {exc}")
             except Exception as exc:

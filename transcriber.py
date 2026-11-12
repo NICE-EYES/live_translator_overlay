@@ -189,6 +189,21 @@ class Segmenter:
                 best_rms, best = r, pos + win // 2
         return best
 
+    @property
+    def speech_seconds(self) -> float:
+        if not self.pending:
+            return 0.0
+        return max(0, self._total - self._silent_run) / TARGET_SR
+
+    def snapshot(self) -> np.ndarray | None:
+        if not self.pending:
+            return None
+        buf = self._buffer()
+        end = self._total
+        if self._silent_run:
+            end = max(self._total - self._silent_run + int(0.2 * TARGET_SR), 0)
+        return buf[:end].copy()
+
     def flush(self) -> np.ndarray | None:
         if not self.pending:
             self._reset()
@@ -238,6 +253,11 @@ class TranscriberWorker(QThread):
         self.cfg = settings.copy()
         self._stop_event = threading.Event()
         self._last_level_emit = 0.0
+        self._cur_id: int | None = None
+        self._cur_lang: str | None = None
+        self._cur_prob = 0.0
+        self._last_partial = 0.0
+        self._partial_interval = settings.partial_interval
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -270,18 +290,22 @@ class TranscriberWorker(QThread):
             return
 
         self.status_changed.emit("listening", f"Слушаю · {capture.description} · {device_desc}")
-        segmenter = Segmenter(max_seconds=cfg.chunk_seconds)
+        if cfg.live_mode:
+            segmenter = Segmenter(max_seconds=cfg.chunk_seconds, min_seconds=0.8, silence_seconds=0.4)
+        else:
+            segmenter = Segmenter(max_seconds=cfg.chunk_seconds)
         last_audio = time.monotonic()
         failed = False
         try:
             while not self._stop_event.is_set():
-                block = capture.read(timeout=0.2)
+                block = capture.read(timeout=0.1)
                 now = time.monotonic()
                 if block is None:
-                    if segmenter.pending and now - last_audio > 0.7:
+                    if segmenter.pending and now - last_audio > 0.5:
                         chunk = segmenter.flush()
                         if chunk is not None:
-                            self._process(model, chunk)
+                            self._process(model, chunk, final=True)
+                        self._end_utterance()
                     continue
                 last_audio = now
                 if now - self._last_level_emit > 0.1:
@@ -290,7 +314,19 @@ class TranscriberWorker(QThread):
                 for chunk in segmenter.add(block):
                     if self._stop_event.is_set():
                         break
-                    self._process(model, chunk)
+                    self._process(model, chunk, final=True)
+                    self._end_utterance()
+                if (cfg.live_mode and not self._stop_event.is_set()
+                        and segmenter.speech_seconds >= 0.6
+                        and time.monotonic() - self._last_partial >= self._partial_interval
+                        and capture.backlog() <= 2):
+                    snap = segmenter.snapshot()
+                    if snap is not None:
+                        t0 = time.monotonic()
+                        self._process(model, snap, final=False)
+                        took = time.monotonic() - t0
+                        self._last_partial = time.monotonic()
+                        self._partial_interval = max(cfg.partial_interval, took * 1.3)
         except Exception as exc:
             failed = True
             log.exception("Ошибка в потоке распознавания")
@@ -300,24 +336,33 @@ class TranscriberWorker(QThread):
         if not failed:
             self.status_changed.emit("stopped", "Остановлено")
 
-    def _process(self, model, audio: np.ndarray) -> None:
+    def _end_utterance(self) -> None:
+        self._cur_id = None
+        self._cur_lang = None
+        self._cur_prob = 0.0
+        self._last_partial = 0.0
+
+    def _process(self, model, audio: np.ndarray, final: bool = True) -> None:
         if audio.size < int(0.3 * TARGET_SR):
             return
         if float(np.sqrt(np.mean(audio * audio))) < 0.002:
             return
         cfg = self.cfg
         forced = None if cfg.speech_language == "auto" else cfg.speech_language
+        language = forced
+        if language is None and self._cur_lang and self._cur_prob >= 0.7:
+            language = self._cur_lang
         try:
             segments, info = model.transcribe(
                 audio,
-                language=forced,
+                language=language,
                 task="transcribe",
-                beam_size=cfg.beam_size,
-                vad_filter=cfg.vad_filter,
+                beam_size=cfg.beam_size if final else 1,
+                vad_filter=cfg.vad_filter and final,
                 vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 200},
                 condition_on_previous_text=False,
                 without_timestamps=True,
-                temperature=[0.0, 0.2, 0.4],
+                temperature=[0.0, 0.2, 0.4] if final else 0.0,
                 no_speech_threshold=0.6,
                 log_prob_threshold=-1.0,
                 compression_ratio_threshold=2.4,
@@ -336,16 +381,28 @@ class TranscriberWorker(QThread):
 
         text = " ".join(texts).strip()
         if not text or is_hallucination(text):
+            if final and self._cur_id is not None:
+                self.utterance_ready.emit({"id": self._cur_id, "discard": True})
             return
 
-        lang = getattr(info, "language", None)
-        prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+        if language is not None and language != forced:
+            lang, prob = self._cur_lang, self._cur_prob
+        else:
+            lang = getattr(info, "language", None)
+            prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+            if forced is not None:
+                prob = 1.0
+            elif prob > self._cur_prob or self._cur_lang is None:
+                self._cur_lang, self._cur_prob = lang, prob
         lang_known = bool(lang) and (forced is not None or prob >= 0.5)
+        if self._cur_id is None:
+            self._cur_id = next(_ids)
         self.utterance_ready.emit({
-            "id": next(_ids),
+            "id": self._cur_id,
             "text": text,
             "lang": lang,
             "lang_prob": prob,
             "lang_known": lang_known,
+            "final": final,
             "ts": time.time(),
         })

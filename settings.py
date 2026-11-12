@@ -118,6 +118,8 @@ class Settings:
     chunk_seconds: float = 4.0
     beam_size: int = 3
     vad_filter: bool = True
+    live_mode: bool = True
+    partial_interval: float = 0.7
 
     target_language: str = "ru"
     translation_mode: str = "local"
@@ -157,6 +159,7 @@ class Settings:
         self.max_history = int(min(1000, max(5, int(self.max_history))))
         self.chunk_seconds = float(min(5.0, max(2.0, float(self.chunk_seconds))))
         self.beam_size = int(min(5, max(1, int(self.beam_size))))
+        self.partial_interval = float(min(3.0, max(0.3, float(self.partial_interval))))
         self.window_w = max(220, int(self.window_w))
         self.window_h = max(60, int(self.window_h))
 

@@ -92,6 +92,9 @@ class BaseCapture:
         except queue.Empty:
             return None
 
+    def backlog(self) -> int:
+        return self._queue.qsize()
+
     def clear(self) -> None:
         while True:
             try:

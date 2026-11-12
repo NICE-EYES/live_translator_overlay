@@ -273,7 +273,10 @@ class SettingsDialog(QDialog):
 
         self.vad_check = QCheckBox("Отсекать тишину и шум (Silero VAD)")
         self.vad_check.setChecked(self.cfg.vad_filter)
+        self.live_check = QCheckBox("Мгновенный режим: показывать текст и перевод во время речи")
+        self.live_check.setChecked(self.cfg.live_mode)
         form.addRow("", self.vad_check)
+        form.addRow("", self.live_check)
         form.addRow("", self._hint("Меньше фрагмент и beam size → меньше задержка; больше → точнее. "
                                    "Аудио всегда обрабатывается только на этом компьютере."))
         self._fill_devices()
@@ -444,6 +447,7 @@ class SettingsDialog(QDialog):
         c.chunk_seconds = float(self.chunk_spin.value())
         c.beam_size = int(self.beam_spin.value())
         c.vad_filter = self.vad_check.isChecked()
+        c.live_mode = self.live_check.isChecked()
         c.target_language = self.target_combo.currentData()
         c.translation_mode = mode
         c.deepl_api_key = self.deepl_key.text().strip()
@@ -463,7 +467,7 @@ class SettingsDialog(QDialog):
         return self.cfg
 
 
-RESTART_KEYS = ("audio_source", "mic_device", "loopback_device", "model_size", "compute_device",
+RESTART_KEYS = ("live_mode", "audio_source", "mic_device", "loopback_device", "model_size", "compute_device",
                 "speech_language", "chunk_seconds", "beam_size", "vad_filter")
 
 
@@ -916,9 +920,20 @@ class OverlayWindow(QWidget):
         if self._rec_state[0] == "error" and self.listening:
             self._rec_state = ("listening", "Слушаю")
             self._refresh_status()
-        entry = dict(u, translation=None, engine="", error="")
-        self.entries.append(entry)
-        self.translation_worker.submit(u["id"], u["text"], u.get("lang"), self.cfg.target_language)
+        e = self._find_entry(u["id"])
+        if u.get("discard"):
+            if e is not None:
+                self.entries.remove(e)
+                self._schedule_render()
+            return
+        if e is None:
+            e = dict(u, translation=None, engine="", error="")
+            self.entries.append(e)
+        else:
+            e.update(text=u["text"], lang=u["lang"], lang_prob=u["lang_prob"],
+                     lang_known=u["lang_known"], final=u.get("final", True), error="")
+        self.translation_worker.submit(u["id"], u["text"], u.get("lang"),
+                                       self.cfg.target_language, u.get("final", True))
         self._schedule_render()
 
     def _find_entry(self, uid: int) -> dict | None:
@@ -955,7 +970,10 @@ class OverlayWindow(QWidget):
             if e.get("lang"):
                 lang += f" (возможно, {language_name(e['lang'])} {e['lang_prob'] * 100:.0f}%)"
             lang_color = "#ff9f43"
-        engine = f" · {esc(e['engine'])}" if e.get("engine") else ""
+        live = not e.get("final", True)
+        engine = f" · {esc(e['engine'])}" if e.get("engine") and not live else ""
+        if live:
+            engine = ' · <span style="color:#3ddc84;">● говорит…</span>'
         parts = [
             f'<p style="margin:0; font-size:{max(7, fs - 3)}pt;">'
             f'<span style="color:#6f7a8c;">{t}</span>&nbsp;&nbsp;'
@@ -966,7 +984,8 @@ class OverlayWindow(QWidget):
             parts.append(f'<p style="margin:1px 0 0 0; color:#a9b3c1; font-size:{max(7, fs - 1)}pt;">'
                          f'{esc(e["text"])}</p>')
         if e.get("translation"):
-            tr = f'<span style="color:#ffffff;">{esc(e["translation"])}</span>'
+            color = "#cfd6e0" if live else "#ffffff"
+            tr = f'<span style="color:{color};">{esc(e["translation"])}</span>'
         elif e.get("error"):
             tr = (f'<span style="color:#ff9f43;">⚠ перевод не удался: {esc(e["error"])}</span>'
                   + ("" if self.cfg.show_original else
