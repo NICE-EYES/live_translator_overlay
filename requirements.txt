@@ -1,0 +1,8 @@
+PySide6>=6.7
+numpy>=1.26
+sounddevice>=0.5.1
+PyAudioWPatch>=0.2.12.7; sys_platform == "win32"
+faster-whisper>=1.1.1
+ctranslate2>=4.5,<5
+argostranslate>=1.10
+requests>=2.32
